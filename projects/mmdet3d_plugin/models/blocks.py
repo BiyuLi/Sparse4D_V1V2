@@ -89,26 +89,33 @@ class DepthReweightModule(BaseModule):
         self.depth_fc = nn.Sequential(*layers)
 
     def forward(self, features, points_3d, output_conf=False):
+        # 计算anchor欧式距离
         reference_depths = torch.norm(
             points_3d[..., :2], dim=-1, p=2, keepdim=True
         )
+        # 距离裁剪到深度范围
         reference_depths = torch.clip(
             reference_depths,
             max=self.max_depth - 1e-5,
             min=self.min_depth + 1e-5,
         )
+        # 对于每个anchor计算其与每个预定义深度之间的欧氏距离torch.abs(reference_depths - points_3d.new_tensor(self.depths)
         weights = (
             1
             - torch.abs(reference_depths - points_3d.new_tensor(self.depths))
             / self.depth_interval
         )
-
+        # 在深度值上找到top2，最大的top2就是最接近anchor位置的两个depth bin
         top2 = weights.topk(2, dim=-1)[0]
+        # 其余位置权重为0
         weights = torch.where(
             weights >= top2[..., 1:2], weights, weights.new_tensor(0.0)
         )
+        # 计算权重平方和，用于后面的归一化
         scale = torch.pow(top2[..., 0:1], 2) + torch.pow(top2[..., 1:2], 2)
+        # FFN计算每个深度的置信度
         confidence = self.depth_fc(features).softmax(dim=-1)
+        # 深度置信度和位置权重相乘并在深度维度上求和作为此anchor feature的最终加权
         confidence = torch.sum(weights * confidence, dim=-1, keepdim=True)
         confidence = confidence / scale
 
@@ -377,12 +384,12 @@ class DeformableFeatureAggregation(BaseModule):
         metas: dict,
         feature_queue=None,
         meta_queue=None,
-        depth_module=None,
+        depth_module=None,    # DepthReweightModule
         anchor_encoder=None,
         **kwargs: dict,
     ):
         bs, num_anchor = instance_feature.shape[:2]
-        if feature_queue is not None and len(feature_queue) > 0:
+        if feature_queue is not None and len(feature_queue) > 0:   # 记录当前帧到历史 len(feature_queue) 帧的投影矩阵
             T_cur2temp_list = []
             for meta in meta_queue:
                 T_cur2temp_list.append(
@@ -391,6 +398,7 @@ class DeformableFeatureAggregation(BaseModule):
                         for i,x in enumerate(meta["img_metas"])
                     ])
                 )
+            # kps投影，先CV模型投影中心点到历史时间戳，再做自车运动补偿
             key_points, temp_key_points_list = self.kps_generator(
                 anchor,
                 instance_feature,
@@ -398,14 +406,29 @@ class DeformableFeatureAggregation(BaseModule):
                 metas["timestamp"],
                 [meta["timestamp"] for meta in meta_queue],
             )
+            # 同理对anchor投影
             temp_anchors = self.kps_generator.anchor_projection(
                 anchor,
                 T_cur2temp_list,
                 metas["timestamp"],
                 [meta["timestamp"] for meta in meta_queue],
             )
+            # anchor embedding
+            '''
+            SparseBox3DEncoder:
+                def forward(self, box_3d: torch.Tensor):
+                    pos_feat = self.pos_fc(box_3d[..., [X, Y, Z]])
+                    size_feat = self.size_fc(box_3d[..., [W, L, H]])
+                    yaw_feat = self.yaw_fc(box_3d[..., [SIN_Y, COS_Y]])
+                    output = pos_feat + size_feat + yaw_feat
+                    if self.vel_dims > 0:
+                        vel_feat = self.vel_fc(box_3d[..., VX:VX+self.vel_dims])
+                        output = output + vel_feat
+                    output = self.output_fc(output)
+                    return output
+            '''
             temp_anchor_embeds = [
-                anchor_encoder(x)
+                anchor_encoder(x)                                 # 此处用了特征sum而不是concate形式，这与V3有非常大的不同
                 if self.use_temporal_anchor_embed and anchor_encoder is not None
                 else None
                 for x in temp_anchors
@@ -447,33 +470,40 @@ class DeformableFeatureAggregation(BaseModule):
             temp_anchor_embeds[::-1] + [anchor_embed],
             temp_anchors[::-1] + [anchor],
             time_intervals[::-1],
-        ):
+        ):   # 将当前帧和历史帧打包一起融合
+
+            ################ 1. 单帧空间融合策略  ###################
+            #######  对于每个keypoint，先做多尺度多视角的特征融合 ######
             if self.use_temporal_anchor_embed and anchor_encoder is not None:
+                # 全连接层直接拿到每个kps的feature权重
                 weights = self._get_weights(instance_feature, temp_anchor_embed)
+            # 将kps通过投影矩阵拿feature (bs, num_anchor, num_cams, num_levels, num_pts, embed_dims)
             temp_features_next = self.feature_sampling(
                 temp_feature_maps,
                 temp_key_points,
                 temp_metas["projection_mat"],
                 temp_metas.get("image_wh"),
             )
+            # 加权在embed_dims维度，然后沿着scale和view维度求和再concate
             temp_features_next = self.multi_view_level_fusion(
                 temp_features_next, weights
-            )
+            )   # (bs, num_anchor, num_pts, embed_dims)
+            # Depth Reweight Module
             if depth_module is not None:
                 temp_features_next = depth_module(
                     temp_features_next, temp_anchor[:, :, None]
                 )
-
-            if features is None:
+            ################ 2. 时序融合策略  ###################
+            if features is None:  # 最早帧
                 features = temp_features_next
-            elif self.temp_module is not None:
+            elif self.temp_module is not None:  # 时序融合 在V2中生效， V3中直接从EDA中移除该模块
                 features = self.temp_module(
                     features, temp_features_next, time_interval
                 )
             else:
-                features = features + temp_features_next
+                features = features + temp_features_next  # V1中采用前后帧特征堆叠的方式完成时序融合
 
-        features = features.sum(dim=2)  # fuse multi-point features
+        features = features.sum(dim=2)  # fuse multi-point features: (bs, num_anchor, num_pts, embed_dims)
         output = self.output_proj(features)
         output = self.dropout(output) + instance_feature
         return output
