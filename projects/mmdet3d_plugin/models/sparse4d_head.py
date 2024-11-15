@@ -188,15 +188,17 @@ class Sparse4DHead(BaseModule):
             )
         for i, op in enumerate(self.operation_order):
             if op == "gnn":
+                # 1. 多头自注意力 update query(对信息做提取和整合)
                 instance_feature = self.layers[i](
                     instance_feature,
                     query_pos=anchor_embed,
                 )
             elif op == "norm" or op == "ffn":
+                # 2. feature经过FFN引入非线性变换(注意力机制对于value只做了线性变换)
                 instance_feature = self.layers[i](instance_feature)
-            elif op == "identity":
+            elif op == "identity":  # V1无tracking
                 identity = instance_feature
-            elif op == "add":
+            elif op == "add":       # v1无tracking
                 instance_feature = instance_feature + identity
             elif op == "deformable":
                 instance_feature = self.layers[i](
