@@ -162,7 +162,7 @@ class Sparse4DHead(BaseModule):
         batch_size = feature_maps[0].shape[0]
         instance_feature = torch.tile(
             self.instance_feature.weight[None], (batch_size, 1, 1)
-        )
+        )  # (batch_size,num_anchor,embed_dims)
         anchor = torch.tile(self.anchor[None], (batch_size, 1, 1))
         anchor_embed = self.anchor_encoder(anchor)
         if self.pre_norm is not None:
@@ -201,6 +201,7 @@ class Sparse4DHead(BaseModule):
             elif op == "add":       # v1无tracking
                 instance_feature = instance_feature + identity
             elif op == "deformable":
+                # 3. feature fusion
                 instance_feature = self.layers[i](
                     instance_feature,
                     anchor,
@@ -213,6 +214,7 @@ class Sparse4DHead(BaseModule):
                     anchor_encoder=self.anchor_encoder,
                 )
             elif op == "refine":
+                # anchor update
                 anchor = self.layers[i](
                     instance_feature,
                     anchor,

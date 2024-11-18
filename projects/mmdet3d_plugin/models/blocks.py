@@ -470,12 +470,16 @@ class DeformableFeatureAggregation(BaseModule):
             temp_anchor_embeds[::-1] + [anchor_embed],
             temp_anchors[::-1] + [anchor],
             time_intervals[::-1],
-        ):   # 将当前帧和历史帧打包一起融合
-
+        ):   # 将当前帧和历史帧打包一起
             ################ 1. 单帧空间融合策略  ###################
-            #######  对于每个keypoint，先做多尺度多视角的特征融合 ######
+            '''
+            即作者所谓的"层级化特征融合"
+            1. instance的kps在多尺度多视角的融合
+            2. 融合instance所有kps特征
+            '''
+            #######  1.1 对于每个keypoint，先做多尺度多视角的特征融合 ######
             if self.use_temporal_anchor_embed and anchor_encoder is not None:
-                # 全连接层直接拿到每个kps的feature权重
+                # 全连接层直接拿到每个kps在不同特征尺度和视角上的feature权重
                 weights = self._get_weights(instance_feature, temp_anchor_embed)
             # 将kps通过投影矩阵拿feature (bs, num_anchor, num_cams, num_levels, num_pts, embed_dims)
             temp_features_next = self.feature_sampling(
@@ -484,11 +488,12 @@ class DeformableFeatureAggregation(BaseModule):
                 temp_metas["projection_mat"],
                 temp_metas.get("image_wh"),
             )
-            # 加权在embed_dims维度，然后沿着scale和view维度求和再concate
+            #######  1.2 融合同一个instance 不同kps的特征 ######
+            # 采用加权求和的方式做kps的特征融合; 加权在embed_dims维度，然后沿着scale和view维度求和再concate
             temp_features_next = self.multi_view_level_fusion(
                 temp_features_next, weights
             )   # (bs, num_anchor, num_pts, embed_dims)
-            # Depth Reweight Module
+            #######  1.3 instance feature 的 Depth Reweight ######
             if depth_module is not None:
                 temp_features_next = depth_module(
                     temp_features_next, temp_anchor[:, :, None]
@@ -502,7 +507,7 @@ class DeformableFeatureAggregation(BaseModule):
                 )
             else:
                 features = features + temp_features_next  # V1中采用前后帧特征堆叠的方式完成时序融合
-
+        # 最后直接用求和的方式融合同一instance不同kps的特征
         features = features.sum(dim=2)  # fuse multi-point features: (bs, num_anchor, num_pts, embed_dims)
         output = self.output_proj(features)
         output = self.dropout(output) + instance_feature
@@ -537,21 +542,27 @@ class DeformableFeatureAggregation(BaseModule):
         num_cams = feature_maps[0].shape[1]
         bs, num_anchor, num_pts = key_points.shape[:3]
 
+        # 拓展到齐次坐标(x, y, z, 1)
         pts_extend = torch.cat(
             [key_points, torch.ones_like(key_points[..., :1])], dim=-1
         )
+        # 投影矩阵将关键点从3D坐标系投影到2D图像平面
         points_2d = torch.matmul(
             projection_mat[:, :, None, None], pts_extend[:, None, ..., None]
         ).squeeze(-1)
+        # 齐次坐标转到图像坐标
         points_2d = points_2d[..., :2] / torch.clamp(
             points_2d[..., 2:3], min=1e-5
         )
+        # 归一化坐标到[0, 1]
         points_2d = points_2d / image_wh[:, :, None, None]
+        # 归一化坐标到[-1, 1]，以便用于 grid_sample 函数
         points_2d = points_2d * 2 - 1
+        #batch_size, num_cams, num_anchor, num_pts, 2 => batch_size * num_cams, num_anchor, num_pts, 2
         points_2d = points_2d.flatten(end_dim=1)
 
         features = []
-        for fm in feature_maps:
+        for fm in feature_maps:  # add num_levels dim
             features.append(
                 torch.nn.functional.grid_sample(
                     fm.flatten(end_dim=1), points_2d
@@ -571,6 +582,8 @@ class DeformableFeatureAggregation(BaseModule):
         features: torch.Tensor,
         weights: torch.Tensor,
     ):
+        # 对于一个关键点在不同特征尺度和视角上的投影，采用了加权求和的方式
+        # 权重系数通过将instance feature和anchor embed输入至全连接网络中得到(self._get_weights)
         bs, num_anchor = weights.shape[:2]
         features = weights * features.reshape(
             features.shape[:-1] + (self.num_groups, self.group_dims)
