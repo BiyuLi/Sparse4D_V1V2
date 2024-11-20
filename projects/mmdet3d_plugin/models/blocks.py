@@ -428,7 +428,7 @@ class DeformableFeatureAggregation(BaseModule):
                     return output
             '''
             temp_anchor_embeds = [
-                anchor_encoder(x)                                 # 此处用了特征sum而不是concate形式，这与V3有非常大的不同
+                anchor_encoder(x)   # 此处用了特征sum而不是concate形式，这与V3有非常大的不同
                 if self.use_temporal_anchor_embed and anchor_encoder is not None
                 else None
                 for x in temp_anchors
@@ -488,7 +488,7 @@ class DeformableFeatureAggregation(BaseModule):
                 temp_metas["projection_mat"],
                 temp_metas.get("image_wh"),
             )
-            #######  1.2 融合同一个instance 不同kps的特征 ######
+            #######  1.2 在scale和Viw维度做sum加权 ######
             # 采用加权求和的方式做kps的特征融合; 加权在embed_dims维度，然后沿着scale和view维度求和再concate
             temp_features_next = self.multi_view_level_fusion(
                 temp_features_next, weights
@@ -501,12 +501,12 @@ class DeformableFeatureAggregation(BaseModule):
             ################ 2. 时序融合策略  ###################
             if features is None:  # 最早帧
                 features = temp_features_next
-            elif self.temp_module is not None:  # 时序融合 在V2中生效， V3中直接从EDA中移除该模块
+            elif self.temp_module is not None:  # 时序融合只在H4中生效， V2，V3中直接从EDA中移除该模块
                 features = self.temp_module(
                     features, temp_features_next, time_interval
-                )
+                )  # LinearFusionModule, 根据间隔时间计算历史帧融合权重再以concat方式融合
             else:
-                features = features + temp_features_next  # V1中采用前后帧特征堆叠的方式完成时序融合
+                features = features + temp_features_next  # H1采用前后帧特征堆叠的方式完成时序融合
         # 最后直接用求和的方式融合同一instance不同kps的特征
         features = features.sum(dim=2)  # fuse multi-point features: (bs, num_anchor, num_pts, embed_dims)
         output = self.output_proj(features)
